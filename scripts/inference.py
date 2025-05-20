@@ -84,7 +84,7 @@ def main(config, args):
         audio_path=args.audio_path,
         video_out_path=args.video_out_path,
         video_mask_path=args.video_out_path.replace(".mp4", "_mask.mp4"),
-        num_frames=config.data.num_frames,
+        num_frames=args.num_frames,
         num_inference_steps=args.inference_steps,
         guidance_scale=args.guidance_scale,
         weight_dtype=dtype,
@@ -98,6 +98,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--unet_config_path", type=str, default="configs/unet.yaml")
     parser.add_argument("--inference_ckpt_path", type=str, required=True)
+    parser.add_argument("--num_frames", type=int, default=16)
     parser.add_argument("--video_path", type=str, required=True)
     parser.add_argument("--audio_path", type=str, required=True)
     parser.add_argument("--video_out_path", type=str, required=True)

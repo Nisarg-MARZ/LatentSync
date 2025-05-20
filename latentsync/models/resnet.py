@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from einops import rearrange
+from einops import rearrange, einops
 
 
 class InflatedConv3d(nn.Conv2d):
@@ -188,18 +188,23 @@ class ResnetBlock3D(nn.Module):
         hidden_states = self.conv1(hidden_states)
 
         if temb is not None:
-            if temb.dim() == 2:
-                # input (1, 1280)
-                temb = self.time_emb_proj(self.nonlinearity(temb))
-                temb = temb[:, :, None, None, None]  # unsqueeze
-            else:
-                # input (1, 1280, 16)
-                temb = temb.permute(0, 2, 1)
-                temb = self.time_emb_proj(self.nonlinearity(temb))
-                if self.double_len_linear is not None:
-                    temb = self.double_len_linear(self.nonlinearity(temb))
-                temb = temb.permute(0, 2, 1)
-                temb = temb[:, :, :, None, None]
+            # input (1, 1280)
+            temb = einops.rearrange(
+                temb, "b t c-> (b t) c"
+            )
+            temb = self.time_emb_proj(self.nonlinearity(temb))
+            temb = einops.rearrange(
+                temb, "(b t) c-> b c t", b=hidden_states.shape[0]
+            )[:, :, :, None, None]
+
+            # else:
+            #     # input (1, 1280, 16)
+            #     temb = temb.permute(0, 2, 1)
+            #     temb = self.time_emb_proj(self.nonlinearity(temb))
+            #     if self.double_len_linear is not None:
+            #         temb = self.double_len_linear(self.nonlinearity(temb))
+            #     temb = temb.permute(0, 2, 1)
+            #     temb = temb[:, :, :, None, None]
 
         if temb is not None and self.time_embedding_norm == "default":
             hidden_states = hidden_states + temb

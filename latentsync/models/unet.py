@@ -13,6 +13,8 @@ from diffusers.models import ModelMixin
 
 from diffusers.utils import BaseOutput, logging
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
+from einops import einops
+
 from .unet_blocks import (
     CrossAttnDownBlock3D,
     CrossAttnUpBlock3D,
@@ -370,8 +372,12 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         elif len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(sample.device)
 
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
+        # # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        # timesteps = timesteps.expand(sample.shape[0])
+
+        timesteps = einops.rearrange(
+            timesteps, "b t -> (b t)"
+        )
 
         t_emb = self.time_proj(timesteps)
 
@@ -380,6 +386,9 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         # there might be better ways to encapsulate this.
         t_emb = t_emb.to(dtype=self.dtype)
         emb = self.time_embedding(t_emb)
+        emb = einops.rearrange(
+            emb, "(b t) c -> b t c", b=sample.shape[0]
+        )
 
         if self.class_embedding is not None:
             if class_labels is None:

@@ -91,6 +91,7 @@ def main(config, args):
         width=config.data.resolution,
         height=config.data.resolution,
         mask_image_path=config.data.mask_image_path,
+        starting_timestep=500
     )
 
 

@@ -380,6 +380,7 @@ class LipsyncPipeline(DiffusionPipeline):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
+        starting_timestep: Optional[int] = 500,
         **kwargs,
     ):
         is_train = self.denoising_unet.training
@@ -421,8 +422,6 @@ class LipsyncPipeline(DiffusionPipeline):
 
         num_channels_latents = self.vae.config.latent_channels
 
-        # num_inferences = math.ceil(len(whisper_chunks) / num_frames)
-        # TODO: Handle what happens to the last chunk of frames! For now, ignoring this issue
         num_inferences = len(whisper_chunks) - num_frames + 1
 
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
@@ -523,7 +522,7 @@ class LipsyncPipeline(DiffusionPipeline):
 
                 self.latents = init_rolling_latents_ddim(latents,
                                                          scheduler,
-                                                         max_t=500,
+                                                         max_t=starting_timestep,
                                                          denoise_steps=num_inference_steps)
                 # Recover the pixel values
                 decoded_latents = self.decode_latents(latents[:, :, :1, ...])
@@ -545,7 +544,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 latents = append_noised_latent_tail(
                     latents=self.latents,
                     scheduler=self.scheduler,
-                    timestep=500,
+                    timestep=starting_timestep,
                     initial_latent=ref_latents[:, :, -1],
                     do_classifier_free_guidance=do_classifier_free_guidance
                 )
@@ -554,7 +553,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     self.rolling_step_table = get_tedi_timestep_tensor_all(
                         window_size=num_frames,
                         max_denoise_step=num_inference_steps,
-                        max_timestep=500,
+                        max_timestep=starting_timestep,
                         device=device
                     )
 
@@ -566,7 +565,8 @@ class LipsyncPipeline(DiffusionPipeline):
                     ref_latents=ref_latents,
                     audio_embeds=audio_embeds,
                     latents=latents,
-                    last_infer=last_infer
+                    last_infer=last_infer,
+                    starting_timestep=starting_timestep
                 )
                 if not last_infer:
                     # Recover the pixel values
@@ -613,6 +613,7 @@ class LipsyncPipeline(DiffusionPipeline):
             audio_embeds,
             latents,
             last_infer=False,
+            starting_timestep=500
     ):
 
         do_classifier_free_guidance = guidance_scale > 1.0
@@ -631,7 +632,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     t_tensor = self.rolling_step_table[-(j + 1)][None,...]
                 else:
                     t_tensor = self.rolling_step_table[-1][None,...]
-                    t_tensor = t_tensor - int((500 / num_inference_steps) * j)
+                    t_tensor = t_tensor - int((starting_timestep / num_inference_steps) * j)
 
                 t_tensor = torch.where(t_tensor < 0, torch.ones_like(t_tensor), t_tensor)
                 denoising_unet_input = self.scheduler.scale_model_input(denoising_unet_input, t_tensor)

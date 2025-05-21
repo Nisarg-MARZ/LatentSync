@@ -29,7 +29,7 @@ run:
   recon_loss_weight: 1 # 1
   guidance_scale: 2.0 # [1.0 - 3.0]
   trepa_loss_weight: 10
-  inference_steps: 20
+  inference_steps: 16
   trainable_modules:
     - motion_modules.
 #    - attentions.

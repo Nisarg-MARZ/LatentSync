@@ -53,6 +53,10 @@ from eval.syncnet import SyncNetEval
 from eval.syncnet_detect import SyncNetDetector
 from eval.eval_sync_conf import syncnet_eval
 import lpips
+import warnings
+
+# turn off all FutureWarning messages
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 logger = get_logger(__name__)
 
@@ -611,14 +615,6 @@ def main(config):
                     )
 
                 logger.info(f"Saved validation video output to {validation_video_out_path}")
-                if os.path.exists(validation_video_out_path):
-                    wandb.log(
-                        {
-                            "val/video": wandb.Video(validation_video_out_path, fps=25, format="mp4"),
-                            "val/sync_conf": conf,
-                        },
-                        step=global_step,
-                    )
                 val_step_list.append(global_step)
 
                 if config.model.add_audio_layer and os.path.exists(validation_video_out_path):
@@ -632,7 +628,14 @@ def main(config):
                         os.path.join(output_dir, f"sync_conf_results/sync_conf_chart-{global_step}.png"),
                         ("Sync confidence", val_step_list, sync_conf_list),
                     )
-
+                if os.path.exists(validation_video_out_path):
+                    wandb.log(
+                        {
+                            "val/video": wandb.Video(validation_video_out_path, fps=25, format="mp4"),
+                            "val/sync_conf": conf,
+                        },
+                        step=global_step,
+                    )
             logs = {"step_loss": loss.item(), "epoch": epoch}
             progress_bar.set_postfix(**logs)
             global_step += 1

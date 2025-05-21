@@ -5,5 +5,5 @@ python -m preprocess.data_processing_pipeline \
     --per_gpu_num_workers 12 \
     --resolution 256 \
     --sync_conf_threshold 3 \
-    --temp_dir temp \
-    --input_dir /mnt/bn/maliva-gen-ai-v2/chunyu.li/VoxCeleb2/raw
+    --temp_dir /mnt/ml/training/Data/CelebV-HQ/latent_sync/processed/ \
+    --input_dir /mnt/ml/training/Data/20s_sample/

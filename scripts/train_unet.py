@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import dataclasses
 import os
+import wandb
 import math
 import argparse
 import shutil
@@ -53,8 +54,105 @@ from eval.syncnet_detect import SyncNetDetector
 from eval.eval_sync_conf import syncnet_eval
 import lpips
 
-
 logger = get_logger(__name__)
+
+
+def add_noise_framewise_channelfirst_auto(
+        latents: torch.Tensor,
+        noise_scheduler,
+        noise_offset: float = 0.05,
+        offset_mode: str = 'framewise',  # 'framewise', 'global', or 'none'
+        noise_pattern: str = 'auto',  # 'auto', 'uniform', 'linear', or 'random'
+        uniform_prob: float = 0.05  # used when noise_pattern == 'auto'
+):
+    """
+    Add noise to video latents [B, C, T, H, W] frame-by-frame.
+
+    Returns:
+        noisy_latents : [B, C, T, H, W]
+        target        : noise or velocity target, [B, C, T, H, W]
+        timesteps     : [B, T]
+    """
+    B, C, T, H, W = latents.shape
+    device = latents.device
+
+    # ------------------------------------------------------------------ noise
+    noise = torch.randn_like(latents)
+    if noise_offset > 0.0:
+        if offset_mode == 'global':
+            noise += noise_offset * torch.randn(B, C, 1, 1, 1, device=device)
+        elif offset_mode == 'framewise':
+            noise += noise_offset * torch.randn(B, C, T, 1, 1, device=device)
+        elif offset_mode != 'none':
+            raise ValueError(f"Invalid offset_mode: {offset_mode}")
+
+    # ----------------------------------------------------------- pattern pick
+    if noise_pattern == 'auto':
+        noise_pattern = 'uniform' if torch.rand(1).item() < uniform_prob else 'linear'
+
+    # -------------------------------------------------------------- timesteps
+    if offset_mode == 'global' or noise_pattern == 'uniform':
+        # all frames share the same timestep (init mode)
+        timesteps = torch.randint(
+            0, noise_scheduler.config.num_train_timesteps, (B, 1), device=device
+        ).long().expand(B, T)
+
+    elif offset_mode == 'framewise':
+        if noise_pattern == 'linear':
+            # monotonically increasing timesteps over T
+            timesteps = torch.sort(
+                torch.randint(
+                    0, noise_scheduler.config.num_train_timesteps, (B, T), device=device
+                ), dim=1
+            ).values
+        elif noise_pattern == 'random':
+            timesteps = torch.randint(
+                0, noise_scheduler.config.num_train_timesteps, (B, T), device=device
+            ).long()
+        else:
+            raise ValueError(f"Invalid noise_pattern: {noise_pattern}")
+
+    else:  # offset_mode == 'none'
+        timesteps = torch.zeros((B, T), dtype=torch.long, device=device)
+
+    # --------------------------------------------------------- add the noise
+    noisy_latents = torch.zeros_like(latents)
+    for b in range(B):
+        for t in range(T):
+            noisy_latents[b, :, t] = noise_scheduler.add_noise(
+                latents[b, :, t],
+                noise[b, :, t],
+                timesteps[b, t]
+            )
+
+    # -------------------------------------------------------------- target
+    if noise_scheduler.prediction_type == "epsilon":
+        target = noise
+    elif noise_scheduler.prediction_type == "v_prediction":
+        latents_ = latents.permute(0, 2, 1, 3, 4).contiguous().view(-1, C, H, W)
+        noise_ = noise.permute(0, 2, 1, 3, 4).contiguous().view(-1, C, H, W)
+        timesteps_ = timesteps.reshape(-1)
+        target_flat = noise_scheduler.get_velocity(latents_, noise_, timesteps_)
+        target = target_flat.view(B, T, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
+    else:
+        raise ValueError(f"Unknown prediction_type: {noise_scheduler.prediction_type}")
+
+    return noisy_latents, target, timesteps
+
+
+def _dataclass_to_dict(obj):
+    """
+    Recursively convert any dataclass instances inside `obj`
+    to plain dicts so they survive json-ification by wandb.
+    """
+    if dataclasses.is_dataclass(obj):
+        obj = dataclasses.asdict(obj)
+
+    if isinstance(obj, dict):
+        return {k: _dataclass_to_dict(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_dataclass_to_dict(v) for v in obj)
+    return obj
 
 
 def main(config):
@@ -63,6 +161,14 @@ def main(config):
     global_rank = dist.get_rank()
     num_processes = dist.get_world_size()
     is_main_process = global_rank == 0
+    wandb_cfg = OmegaConf.to_container(config, resolve=True, enum_to_str=True)
+    wandb_cfg = _dataclass_to_dict(wandb_cfg)
+    if is_main_process:
+        wandb.init(
+            project="latent-sync-unet",
+            config=wandb_cfg,
+            save_code=True,
+        )
 
     seed = config.run.seed + global_rank
     set_seed(seed)
@@ -220,8 +326,11 @@ def main(config):
     ).to(device)
     pipeline.set_progress_bar_config(disable=True)
 
+    # print(f"[Rank {dist.get_rank()}]  ✅ about to wrap the model")
+    # dist.barrier()  # <- wait for everybody here
+    # print(f"[Rank {dist.get_rank()}]  🚀 passed the barrier")
     # DDP warpper
-    denoising_unet = DDP(denoising_unet, device_ids=[local_rank], output_device=local_rank)
+    # denoising_unet = DDP(denoising_unet, device_ids=[local_rank], output_device=local_rank)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader))
@@ -304,50 +413,60 @@ def main(config):
             masks = torch.nn.functional.interpolate(masks, size=config.data.resolution // vae_scale_factor)
 
             gt_latents = (
-                rearrange(gt_latents, "(b f) c h w -> b c f h w", f=config.data.num_frames) - vae.config.shift_factor
-            ) * vae.config.scaling_factor
+                                 rearrange(gt_latents, "(b f) c h w -> b c f h w",
+                                           f=config.data.num_frames) - vae.config.shift_factor
+                         ) * vae.config.scaling_factor
             masked_latents = (
-                rearrange(masked_latents, "(b f) c h w -> b c f h w", f=config.data.num_frames)
-                - vae.config.shift_factor
-            ) * vae.config.scaling_factor
+                                     rearrange(masked_latents, "(b f) c h w -> b c f h w", f=config.data.num_frames)
+                                     - vae.config.shift_factor
+                             ) * vae.config.scaling_factor
             ref_latents = (
-                rearrange(ref_latents, "(b f) c h w -> b c f h w", f=config.data.num_frames) - vae.config.shift_factor
-            ) * vae.config.scaling_factor
+                                  rearrange(ref_latents, "(b f) c h w -> b c f h w",
+                                            f=config.data.num_frames) - vae.config.shift_factor
+                          ) * vae.config.scaling_factor
             masks = rearrange(masks, "(b f) c h w -> b c f h w", f=config.data.num_frames)
 
             # Sample noise that we'll add to the latents
-            if config.run.use_mixed_noise:
-                # Refer to the paper: https://arxiv.org/abs/2305.10474
-                noise_shared_std_dev = (config.run.mixed_noise_alpha**2 / (1 + config.run.mixed_noise_alpha**2)) ** 0.5
-                noise_shared = torch.randn_like(gt_latents) * noise_shared_std_dev
-                noise_shared = noise_shared[:, :, 0:1].repeat(1, 1, config.data.num_frames, 1, 1)
-
-                noise_ind_std_dev = (1 / (1 + config.run.mixed_noise_alpha**2)) ** 0.5
-                noise_ind = torch.randn_like(gt_latents) * noise_ind_std_dev
-                noise = noise_ind + noise_shared
-            else:
-                noise = torch.randn_like(gt_latents)
-                noise = noise[:, :, 0:1].repeat(
-                    1, 1, config.data.num_frames, 1, 1
-                )  # Using the same noise for all frames, refer to the paper: https://arxiv.org/abs/2308.09716
+            # if config.run.use_mixed_noise:
+            #     # Refer to the paper: https://arxiv.org/abs/2305.10474
+            #     noise_shared_std_dev = (config.run.mixed_noise_alpha ** 2 / (
+            #                 1 + config.run.mixed_noise_alpha ** 2)) ** 0.5
+            #     noise_shared = torch.randn_like(gt_latents) * noise_shared_std_dev
+            #     noise_shared = noise_shared[:, :, 0:1].repeat(1, 1, config.data.num_frames, 1, 1)
+            #
+            #     noise_ind_std_dev = (1 / (1 + config.run.mixed_noise_alpha ** 2)) ** 0.5
+            #     noise_ind = torch.randn_like(gt_latents) * noise_ind_std_dev
+            #     noise = noise_ind + noise_shared
+            # else:
+            #     noise = torch.randn_like(gt_latents)
+            #     noise = noise[:, :, 0:1].repeat(
+            #         1, 1, config.data.num_frames, 1, 1
+            #     )  # Using the same noise for all frames, refer to the paper: https://arxiv.org/abs/2308.09716
 
             bsz = gt_latents.shape[0]
 
-            # Sample a random timestep for each video
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=gt_latents.device)
-            timesteps = timesteps.long()
+            # # Sample a random timestep for each video
+            # timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=gt_latents.device)
+            # timesteps = timesteps.long()
+            #
+            # # Add noise to the latents according to the noise magnitude at each timestep
+            # # (this is the forward diffusion process)
+            # noisy_gt_latents = noise_scheduler.add_noise(gt_latents, noise, timesteps)
+            #
+            # # Get the target for loss depending on the prediction type
+            # if noise_scheduler.config.prediction_type == "epsilon":
+            #     target = noise
+            # elif noise_scheduler.config.prediction_type == "v_prediction":
+            #     raise NotImplementedError
+            # else:
+            #     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-            # Add noise to the latents according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
-            noisy_gt_latents = noise_scheduler.add_noise(gt_latents, noise, timesteps)
-
-            # Get the target for loss depending on the prediction type
-            if noise_scheduler.config.prediction_type == "epsilon":
-                target = noise
-            elif noise_scheduler.config.prediction_type == "v_prediction":
-                raise NotImplementedError
-            else:
-                raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+            optimizer.zero_grad()
+            noisy_gt_latents, target, timesteps = add_noise_framewise_channelfirst_auto(
+                gt_latents,
+                noise_scheduler,
+                offset_mode='framewise'
+            )
 
             denoising_unet_input = torch.cat([noisy_gt_latents, masks, masked_latents, ref_latents], dim=1)
 
@@ -370,8 +489,8 @@ def main(config):
                 ).sample
 
             if config.run.perceptual_loss_weight != 0 and config.run.pixel_space_supervise:
-                pred_pixel_values_perceptual = pred_pixel_values[:, :, pred_pixel_values.shape[2] // 2 :, :]
-                gt_pixel_values_perceptual = gt_pixel_values[:, :, gt_pixel_values.shape[2] // 2 :, :]
+                pred_pixel_values_perceptual = pred_pixel_values[:, :, pred_pixel_values.shape[2] // 2:, :]
+                gt_pixel_values_perceptual = gt_pixel_values[:, :, gt_pixel_values.shape[2] // 2:, :]
                 lpips_loss = lpips_loss_func(
                     pred_pixel_values_perceptual.float(), gt_pixel_values_perceptual.float()
                 ).mean()
@@ -399,7 +518,7 @@ def main(config):
 
                 if syncnet_config.data.lower_half:
                     height = syncnet_input.shape[2]
-                    syncnet_input = syncnet_input[:, :, height // 2 :, :]
+                    syncnet_input = syncnet_input[:, :, height // 2:, :]
                 ones_tensor = torch.ones((config.data.batch_size, 1)).float().to(device=device)
                 vision_embeds, audio_embeds = syncnet(syncnet_input, mel)
                 sync_loss = cosine_loss(vision_embeds.float(), audio_embeds.float(), ones_tensor).mean()
@@ -407,15 +526,13 @@ def main(config):
                 sync_loss = 0
 
             loss = (
-                recon_loss * config.run.recon_loss_weight
-                + sync_loss * config.run.sync_loss_weight
-                + lpips_loss * config.run.perceptual_loss_weight
-                + trepa_loss * config.run.trepa_loss_weight
+                    recon_loss * config.run.recon_loss_weight
+                    + sync_loss * config.run.sync_loss_weight
+                    + lpips_loss * config.run.perceptual_loss_weight
+                    + trepa_loss * config.run.trepa_loss_weight
             )
 
             train_step_list.append(global_step)
-
-            optimizer.zero_grad()
 
             # Backpropagate
             if config.run.mixed_precision_training:
@@ -433,12 +550,29 @@ def main(config):
                 """ <<< gradient clipping <<< """
                 optimizer.step()
 
+            if is_main_process:
+                wandb.log(
+                    {
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "lr": lr_scheduler.get_last_lr()[0],
+                        "loss/total": loss.item(),
+                        "loss/recon": recon_loss.item(),
+                        "loss/sync": sync_loss.item(),
+                        "loss/lpips": lpips_loss.item(),
+                        "loss/trepa": trepa_loss.item(),
+                    },
+                    step=global_step,
+                    commit=True,
+                )
+
+            progress_bar.set_postfix(step_loss=loss.item(), epoch=epoch)
+
             # Check the grad of attn blocks for debugging
             # print(denoising_unet.module.up_blocks[3].attentions[2].transformer_blocks[0].attn2.to_q.weight.grad)
 
             lr_scheduler.step()
             progress_bar.update(1)
-            global_step += 1
 
             ### <<<< Training <<<< ###
 
@@ -447,7 +581,7 @@ def main(config):
                 model_save_path = os.path.join(output_dir, f"checkpoints/checkpoint-{global_step}.pt")
                 state_dict = {
                     "global_step": global_step,
-                    "state_dict": denoising_unet.module.state_dict(),
+                    "state_dict": denoising_unet.state_dict(),
                 }
                 try:
                     torch.save(state_dict, model_save_path)
@@ -477,7 +611,14 @@ def main(config):
                     )
 
                 logger.info(f"Saved validation video output to {validation_video_out_path}")
-
+                if os.path.exists(validation_video_out_path):
+                    wandb.log(
+                        {
+                            "val/video": wandb.Video(validation_video_out_path, fps=25, format="mp4"),
+                            "val/sync_conf": conf,
+                        },
+                        step=global_step,
+                    )
                 val_step_list.append(global_step)
 
                 if config.model.add_audio_layer and os.path.exists(validation_video_out_path):
@@ -494,6 +635,7 @@ def main(config):
 
             logs = {"step_loss": loss.item(), "epoch": epoch}
             progress_bar.set_postfix(**logs)
+            global_step += 1
 
             if global_step >= config.run.max_train_steps:
                 break

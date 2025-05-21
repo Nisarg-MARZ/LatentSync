@@ -1,10 +1,10 @@
 data:
   syncnet_config_path: configs/syncnet/syncnet_16_pixel_attn.yaml
   train_output_dir: debug/unet
-  train_fileslist: /mnt/bn/maliva-gen-ai-v2/chunyu.li/fileslist/data_v10_core.txt
-  train_data_dir: ""
-  audio_embeds_cache_dir: /mnt/bn/maliva-gen-ai-v2/chunyu.li/audio_cache/embeds
-  audio_mel_cache_dir: /mnt/bn/maliva-gen-ai-v2/chunyu.li/audio_cache/mel
+  train_fileslist: ""
+  train_data_dir: /mnt/ml/training/Data/20s_sample/resampled/
+  audio_embeds_cache_dir: /mnt/ml/training/Data/20s_sample/resampled//audio_cache/embeds
+  audio_mel_cache_dir: /mnt/ml/training/Data/20s_sample/resampled/audio_cache/mel
 
   val_video_path: assets/demo1_video.mp4
   val_audio_path: assets/demo1_audio.wav
@@ -19,7 +19,7 @@ data:
 
 ckpt:
   resume_ckpt_path: checkpoints/latentsync_unet.pt
-  save_ckpt_steps: 10000
+  save_ckpt_steps: 3000
 
 run:
   pixel_space_supervise: true
@@ -32,9 +32,9 @@ run:
   inference_steps: 20
   trainable_modules:
     - motion_modules.
-    - attentions.
+#    - attentions.
   seed: 1247
-  use_mixed_noise: true
+  use_mixed_noise: false
   mixed_noise_alpha: 1 # 1
   mixed_precision_training: true
   enable_gradient_checkpointing: true

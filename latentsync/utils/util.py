@@ -32,7 +32,6 @@ from decord import AudioReader, VideoReader
 import shutil
 import subprocess
 
-
 # Machine epsilon for a float32 (single precision)
 eps = np.finfo(np.float32).eps
 
@@ -114,12 +113,12 @@ def read_audio(audio_path: str, audio_sample_rate: int = 16000):
 
 def write_video(video_output_path: str, video_frames: np.ndarray, fps: int):
     with imageio.get_writer(
-        video_output_path,
-        fps=fps,
-        codec="libx264",
-        macro_block_size=None,
-        ffmpeg_params=["-crf", "13"],
-        ffmpeg_log_level="error",
+            video_output_path,
+            fps=fps,
+            codec="libx264",
+            macro_block_size=None,
+            ffmpeg_params=["-crf", "13"],
+            ffmpeg_log_level="error",
     ) as writer:
         for video_frame in video_frames:
             writer.append_data(video_frame)
@@ -165,23 +164,60 @@ def check_video_fps(video_path: str):
         raise ValueError(f"Video FPS is not 25, it is {fps}. Please convert the video to 25 FPS.")
 
 
-def one_step_sampling(ddim_scheduler, pred_noise, timesteps, x_t):
-    # Compute alphas, betas
-    alpha_prod_t = ddim_scheduler.alphas_cumprod[timesteps].to(dtype=pred_noise.dtype)
-    beta_prod_t = 1 - alpha_prod_t
+# def one_step_sampling(ddim_scheduler, pred_noise, timesteps, x_t):
+#     # Compute alphas, betas
+#     alpha_prod_t = ddim_scheduler.alphas_cumprod[timesteps].to(dtype=pred_noise.dtype)
+#     beta_prod_t = 1 - alpha_prod_t
+#
+#     # 3. compute predicted original sample from predicted noise also called
+#     # "predicted x_0" of formula (12) from https://arxiv.org/abs/2010.02502
+#     if ddim_scheduler.config.prediction_type == "epsilon":
+#         beta_prod_t = beta_prod_t[:, None, None, None, None]
+#         alpha_prod_t = alpha_prod_t[:, None, None, None, None]
+#         pred_original_sample = (x_t - beta_prod_t ** (0.5) * pred_noise) / alpha_prod_t ** (0.5)
+#     else:
+#         raise NotImplementedError("This prediction type is not implemented yet")
+#
+#     # Clip "predicted x_0"
+#     if ddim_scheduler.config.clip_sample:
+#         pred_original_sample = torch.clamp(pred_original_sample, -1, 1)
+#     return pred_original_sample
 
-    # 3. compute predicted original sample from predicted noise also called
-    # "predicted x_0" of formula (12) from https://arxiv.org/abs/2010.02502
-    if ddim_scheduler.config.prediction_type == "epsilon":
-        beta_prod_t = beta_prod_t[:, None, None, None, None]
-        alpha_prod_t = alpha_prod_t[:, None, None, None, None]
-        pred_original_sample = (x_t - beta_prod_t ** (0.5) * pred_noise) / alpha_prod_t ** (0.5)
-    else:
-        raise NotImplementedError("This prediction type is not implemented yet")
 
-    # Clip "predicted x_0"
+def one_step_sampling(
+    ddim_scheduler,
+    pred_noise: torch.Tensor,      # [B, C, …]  same shape as x_t
+    timesteps: torch.Tensor,       # [B, T]
+    x_t: torch.Tensor,             # noisy latents [B, C, …]
+    seq_dim: int = 2               # which dim of x_t is the T dimension
+):
+    """
+    • timesteps : [B, T]  (batch, sequence)
+    • x_t       : [B, C, T, H, W] *or* [B, C, D, T, H, W] …
+      seq_dim tells us where 'T' lives inside x_t.
+    """
+
+    # ----- gather α_t and β_t ------------------------------------------------
+    # 1. lookup ᾱ_t (alphas_cumprod) for every [B,T] pair
+    alpha_prod_t = ddim_scheduler.alphas_cumprod[timesteps]          # [B, T]
+    beta_prod_t  = 1 - alpha_prod_t                                 # [B, T]
+
+    # 2. reshape to broadcast onto x_t
+    #    shape = [B, 1, …, T, …] with 1s everywhere except batch & seq_dim
+    shape = [x_t.size(0)] + [1] * (x_t.ndim - 1)                    # [B, 1, 1, …]
+    shape[seq_dim] = x_t.size(seq_dim)                              # put T in the right slot
+    alpha_prod_t = alpha_prod_t.view(*shape).to(dtype=x_t.dtype)
+    beta_prod_t  = beta_prod_t .view(*shape).to(dtype=x_t.dtype)
+
+    # ----- predict x_0 -------------------------------------------------------
+    if ddim_scheduler.config.prediction_type != "epsilon":
+        raise NotImplementedError("This helper only supports prediction_type='epsilon'")
+
+    pred_original_sample = (x_t - beta_prod_t.sqrt() * pred_noise) / alpha_prod_t.sqrt()
+
     if ddim_scheduler.config.clip_sample:
-        pred_original_sample = torch.clamp(pred_original_sample, -1, 1)
+        pred_original_sample = torch.clamp(pred_original_sample, -1.0, 1.0)
+
     return pred_original_sample
 
 

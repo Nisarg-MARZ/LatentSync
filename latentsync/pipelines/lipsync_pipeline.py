@@ -5,7 +5,7 @@ import math
 import os
 import shutil
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional, Union, Literal
 import subprocess
 
 import numpy as np
@@ -545,8 +545,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     latents=self.latents,
                     scheduler=self.scheduler,
                     timestep=starting_timestep,
-                    initial_latent=ref_latents[:, :, -1],
-                    do_classifier_free_guidance=do_classifier_free_guidance
+                    initial_latent=ref_latents[:, :, -1]
                 )
 
                 if self.rolling_step_table is None:
@@ -672,7 +671,7 @@ def append_noised_latent_tail(latents: torch.Tensor,
                               scheduler,
                               timestep=500,
                               initial_latent: torch.Tensor = None,
-                              do_classifier_free_guidance=False):
+                              ):
     """
     Append a new noisy latent to the tail by reusing the first frame with added noise at a fixed timestep.
 
@@ -721,10 +720,12 @@ def get_tedi_timestep_tensor_all(
     C = max_denoise_step // window_size
     T = window_size
     K = max_denoise_step
-
+    shift = round(0.15 * max_timestep / max_denoise_step)
     # Create synthetic timesteps from 0 to max_timestep
-    synthetic_timesteps = torch.linspace(0, max_timestep, steps=K).long()  # [K]
-
+    # synthetic_timesteps = torch.linspace(0, max_timestep, steps=K).long()  # [K]
+    synthetic_timesteps = make_schedule(
+        K, max_timestep, mode='shift', shift=7, device=device
+    )                                                 # [K]
     # Build index: t[c][j] = synthetic_timesteps[c * T + j]
     index_matrix = torch.arange(T).unsqueeze(1) * C + torch.arange(C).unsqueeze(0)
     index_matrix = index_matrix.permute(1,0)
@@ -747,10 +748,17 @@ def init_rolling_latents_ddim(clean_latents, scheduler, max_t=999, denoise_steps
         [B, C, T, H, W] noisy latents
     """
     B, C, T, H, W = clean_latents.shape
+    shift = round(0.15 * max_t / denoise_steps)
 
     # Compute timestep for each position t in [0..T-1]
-    t_values = torch.linspace(0, max_t * (T - 1) / denoise_steps, steps=T).long().to(clean_latents.device)  # [T]
-
+    # t_values = torch.linspace(0, max_t * (T - 1) / denoise_steps, steps=T).long().to(clean_latents.device)  # [T]
+    t_values = make_schedule(
+        T,                        # we need one timestep per **frame**
+        max_t,
+        mode='shift',
+        shift=7,
+        device=clean_latents.device
+    )
     # Generate random noise for each sample, frame
     noise = torch.randn_like(clean_latents)  # [B, C, T, H, W]
     noisy_latents = []
@@ -769,9 +777,33 @@ def init_rolling_latents_ddim(clean_latents, scheduler, max_t=999, denoise_steps
     return torch.stack(noisy_latents, dim=0).permute(1, 2, 0, 3, 4).contiguous()
 
 
-@dataclass
-class Conds2ImagePipelineOutput(BaseOutput):
-    images: Union[torch.Tensor, np.ndarray]
+def make_schedule(
+    K: int,
+    max_t: int,
+    mode: Literal["linear", "linear_quadratic", "shift"] = "linear",
+    shift: int | float = 0,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """
+    Return a length-K tensor of integer timesteps ∈ [0, max_t].
+
+    - *linear*            :  0 … max_t  (your current behaviour)
+    - *linear_quadratic*  :  (i / K)**2 * max_t  → coarse → fine
+    - *shift*             :  ((i + s) / (K-1 + s)) * max_t
+                             (skips the very noisiest part;         s ≈ 0.15*K is a good start)
+    """
+    i = torch.arange(K, device=device)
+
+    if mode == "linear":
+        r = i / (K - 1)
+    elif mode == "linear_quadratic":
+        r = (i / (K - 1)) ** 2
+    elif mode == "shift":
+        r = (i + shift) / (K - 1 + shift)
+    else:
+        raise ValueError(f"Unknown mode {mode}")
+
+    return (r * max_t).round().long()          # ↑ convert to scheduler integer domain
 
 
 def step_per_frame(scheduler, latents, noise_pred, t_tensor, **kwargs):
